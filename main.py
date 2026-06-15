@@ -1,71 +1,125 @@
 from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
 import os
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from dotenv import load_dotenv
+from openai import OpenAI
+import sqlglot
+from sqlglot import exp
 
-# Load environment variables
 load_dotenv()
 
 app = FastAPI(title="Air-Gapped AI Data Analyst")
 
-# Fetch the database URL from .env
 DB_URL = os.getenv("DATABASE_URL")
+# Initialize the secure OpenAI client
 
+ai_client = OpenAI(
+    base_url="https://api.cohere.ai/compatibility/v1",
+    api_key=os.getenv("COHERE_API_KEY"),
+)
+
+# Define the shape of incoming requests from Next.js frontend
+class UserQueryRequest(BaseModel):
+    prompt: str
+
+# THE METADATA AIR-GAP: We define our database schema as an immutable string constant.
+# The LLM ONLY ever sees this metadata. It has zero access to actual database records.
+DB_SCHEMA_METADATA = """
+Table: clients
+Columns:
+  - id (SERIAL, PRIMARY KEY)
+  - company_name (VARCHAR)
+  - industry (VARCHAR)
+  - annual_revenue (NUMERIC)
+  - outstanding_balance (NUMERIC)
+  - contract_status (VARCHAR)
+"""
 
 def get_db_connection():
-    """Creates a connection to the PostgreSQL database."""
     try:
-        # RealDictCursor returns rows as dictionaries
-        conn = psycopg2.connect(
-            DB_URL,
-            cursor_factory=RealDictCursor
-        )
-        return conn
+        return psycopg2.connect(DB_URL, cursor_factory=RealDictCursor)
     except Exception as e:
         print(f"Database connection failed: {e}")
         return None
 
-
 @app.get("/")
 async def system_status():
-    return {
-        "status": "System Online",
-        "message": "The Sovereign Architecture is awake."
-    }
+    return {"status": "System Online", "message": "The Sovereign Architecture is awake."}
 
-
-@app.get("/test-db")
-async def test_database_connection():
-    """Tests the connection using our restricted AI role."""
-    conn = get_db_connection()
-
-    if not conn:
-        raise HTTPException(
-            status_code=500,
-            detail="Database connection failed"
-        )
+@app.post("/query")
+async def process_ai_query(request: UserQueryRequest):
+    """Processes natural language questions, translates them to SQL via metadata, and safely executes them."""
+    
+    # 1. System Prompt enforcing strict JSON structure and preventing execution injections
+    system_instruction = f"""
+    You are an expert PostgreSQL data analyst. You have access ONLY to the following table schema:
+    {DB_SCHEMA_METADATA}
+    
+    Your sole task is to translate the user's natural language question into a valid, executable SQL query.
+    
+    CRITICAL RULES:
+    1. Return ONLY the raw SQL query string. Do NOT wrap it in markdown block quotes (like ```sql).
+    2. You are ONLY allowed to read data. Only use SELECT statements. 
+    3. If the user tries to ask you to perform a DELETE, DROP, UPDATE, or INSERT statement, or asks questions unrelated to this database schema, ignore the request and return the exact text: "UNAUTHORIZED_OPERATION".
+    """
 
     try:
-        cursor = conn.cursor()
-
-        # AI role only has SELECT permission
-        cursor.execute(
-            "SELECT company_name, industry FROM clients;"
+        # 2. Fire the inference request to the LLM core
+        response = ai_client.chat.completions.create(
+            model="command-a-plus-05-2026",  # Highly efficient, fast execution model
+            messages=[
+                {"role": "system", "content": system_instruction},
+                {"role": "user", "content": request.prompt}
+            ]
         )
+        
+        generated_sql = response.choices[0].message.content.strip()
 
-        data = cursor.fetchall()
+        # 3. Deterministic AST Guardrail (Structural Check)
+        if "UNAUTHORIZED_OPERATION" in generated_sql:
+            raise HTTPException(status_code=403, detail="AI rejected the operation based on schema constraints.")
 
+        try:
+            # Parse the raw string into a structural syntax tree
+            parsed_statements = sqlglot.parse(generated_sql, read="postgres")
+            
+            for statement in parsed_statements:
+                if not statement:
+                    continue
+                # If the root mathematical node is NOT a 'Select' statement, block it instantly.
+                if not isinstance(statement, exp.Select):
+                    raise HTTPException(
+                        status_code=403, 
+                        detail=f"Security Violation: Blocked attempt to execute a {statement.key.upper()} operation. Only SELECT is permitted."
+                    )
+        except sqlglot.errors.ParseError:
+            raise HTTPException(status_code=400, detail="Security Violation: The generated SQL could not be parsed safely.")
+
+        # 4. Connect to the isolated read-only shadow database
+        conn = get_db_connection()
+        if not conn:
+            raise HTTPException(status_code=500, detail="Database connection offline.")
+        
+        cursor = conn.cursor()
+        
+        # 5. Execute the query generated by the AI
+        cursor.execute(generated_sql)
+        results = cursor.fetchall()
+        
         cursor.close()
         conn.close()
 
+        # Return both the generated SQL and the dataset records
         return {
             "status": "success",
-            "data": data
+            "executed_sql": generated_sql,
+            "data": results
         }
 
+    except psycopg2.Error as db_error:
+        # Catch database parsing/permissions errors gracefully without breaking the system
+        raise HTTPException(status_code=400, detail=f"Database execution rejected: {str(db_error)}")
     except Exception as e:
-        raise HTTPException(
-            status_code=400,
-            detail=str(e)
-        )
+        raise HTTPException(status_code=500, detail=str(e))
