@@ -7,10 +7,20 @@ from dotenv import load_dotenv
 from openai import OpenAI
 import sqlglot
 from sqlglot import exp
+from fastapi.middleware.cors import CORSMiddleware
 
 load_dotenv()
 
 app = FastAPI(title="Air-Gapped AI Data Analyst")
+
+# Allow the Next.js frontend to communicate with this backend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 DB_URL = os.getenv("DATABASE_URL")
 # Initialize the secure OpenAI client
