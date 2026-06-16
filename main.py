@@ -16,7 +16,9 @@ app = FastAPI(title="Air-Gapped AI Data Analyst")
 # Allow the Next.js frontend to communicate with this backend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=["http://localhost:3000",
+                   "https://ai-data-analyst-frontend-amber.vercel.app"
+                   ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
